@@ -6,17 +6,21 @@ Expected layout:
         DMR/     *.pcm
         P25/     *.pcm
         TETRA/   *.pcm
-        ...
+        Noise/   *.pcm      (optional: recordings of empty channels)
 
-Key differences from the first version:
-  * train/val split is done by RECORDING, not by window (no leakage)
-  * recordings are resampled to one common sample rate
-  * windows are cut lazily from each recording (no duplicated data in RAM)
-  * random augmentation: frequency offset, phase, noise, time jitter
-  * class-balanced sampling
-  * ResNet + GRU model with I, Q, amplitude and instantaneous-frequency inputs
-  * best checkpoint (by val loss) is saved, with early stopping
-  * confusion matrix and per-recording accuracy on the val set
+Pipeline:
+  * train/val split by RECORDING (no leakage between overlapping windows)
+  * recordings resampled to one common sample rate
+  * energy gate per recording: each window gets an "occupancy" (active fraction)
+      - occupancy >= min_occupancy       -> labelled with the recording's class
+      - occupancy <= noise_max_occupancy -> labelled "Noise" (auto noise class)
+      - in between                       -> dropped (ambiguous)
+    Gaps INSIDE a transmission (TDMA slots) stay in the signal windows on purpose:
+    the on/off rhythm is a useful feature.
+  * augmentation: frequency offset, phase, noise, time jitter
+  * class-balanced sampling, ResNet + GRU model
+  * best checkpoint by val loss, early stopping
+  * confusion matrix and per-recording verdicts on the val set
 """
 
 import argparse
@@ -29,33 +33,50 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from common import (
+    DEFAULT_GATE, OccupancyIndex, activity_mask, aggregate_recording,
     augment_iq, build_model, iq_to_features, load_recording,
     parse_sample_rate, window_starts,
 )
+
+DEFAULT_NOISE_NAME = "Noise"
 
 
 # ---------------------------------------------------------------------------
 # Data discovery and splitting
 # ---------------------------------------------------------------------------
 
-def discover_files(root_dir):
+def discover_files(root_dir, auto_noise):
+    """
+    Returns (class_names, noise_idx, files) where files = [(path, label, is_noise_rec)].
+    Signal classes are sorted; the noise class (if any) is always last.
+    A folder named 'noise' (any case) is treated as the noise class.
+    """
     root = Path(root_dir)
-    class_names = sorted(p.name for p in root.iterdir() if p.is_dir())
+    folders = sorted(p for p in root.iterdir() if p.is_dir())
+    noise_folder = next((p for p in folders if p.name.lower() == "noise"), None)
+    signal_folders = [p for p in folders if p is not noise_folder]
+
+    class_names = [p.name for p in signal_folders]
+    noise_idx = None
+    if noise_folder is not None or auto_noise:
+        class_names.append(noise_folder.name if noise_folder else DEFAULT_NOISE_NAME)
+        noise_idx = len(class_names) - 1
+
     files = []
-    for label, name in enumerate(class_names):
-        for pcm in sorted((root / name).glob("*.pcm")):
-            files.append((pcm, label))
-    return class_names, files
+    for label, folder in enumerate(signal_folders):
+        files += [(pcm, label, False) for pcm in sorted(folder.glob("*.pcm"))]
+    if noise_folder is not None:
+        files += [(pcm, noise_idx, True) for pcm in sorted(noise_folder.glob("*.pcm"))]
+    return class_names, noise_idx, files
 
 
 def choose_sample_rate(files, override=None):
     if override:
         return override
-    rates = [parse_sample_rate(f) for f, _ in files]
-    rates = [r for r in rates if r is not None]
+    rates = [r for r in (parse_sample_rate(f) for f, _, _ in files) if r is not None]
     if not rates:
         print("WARNING: no sample rates found in filenames; frequency-offset "
-              "augmentation will be phase-only.")
+              "augmentation will be phase-only and the gate uses 100-sample blocks.")
         return None
     counts = Counter(rates)
     if len(counts) > 1:
@@ -65,17 +86,16 @@ def choose_sample_rate(files, override=None):
 
 def split_by_recording(files, class_names, val_fraction, window_size, seed):
     """
-    Returns train/val lists of segments: dict(path, label, start, end, file_id).
+    Returns train/val lists of segments: dict(path, label, is_noise_rec, start, end, file_id).
 
     Classes with >= 2 recordings: whole recordings go to either train or val.
     Classes with only 1 recording: that recording is split in time
-    (first part train, last part val, with a one-window gap). This is weaker
-    than a recording-level split, so the script warns about it.
+    (first part train, last part val, with a one-window gap), with a warning.
     """
     rng = np.random.default_rng(seed)
     by_class = defaultdict(list)
-    for file_id, (path, label) in enumerate(files):
-        by_class[label].append((file_id, path))
+    for file_id, (path, label, is_noise) in enumerate(files):
+        by_class[label].append((file_id, path, is_noise))
 
     train, val = [], []
     for label, entries in sorted(by_class.items()):
@@ -84,18 +104,19 @@ def split_by_recording(files, class_names, val_fraction, window_size, seed):
 
         if len(entries) >= 2:
             n_val = max(1, int(round(len(entries) * val_fraction)))
-            for i, (file_id, path) in enumerate(entries):
-                seg = dict(path=path, label=label, start=0, end=None, file_id=file_id)
+            for i, (file_id, path, is_noise) in enumerate(entries):
+                seg = dict(path=path, label=label, is_noise_rec=is_noise,
+                           start=0, end=None, file_id=file_id)
                 (val if i < n_val else train).append(seg)
         else:
-            file_id, path = entries[0]
+            file_id, path, is_noise = entries[0]
             print(f"WARNING: class '{class_names[label]}' has only one recording; "
                   f"splitting it in time. Val accuracy for this class is optimistic. "
                   f"Add more recordings!")
-            train.append(dict(path=path, label=label, start=0, end=-val_fraction,
-                              file_id=file_id, gap=window_size))
-            val.append(dict(path=path, label=label, start=-val_fraction, end=None,
-                            file_id=file_id))
+            train.append(dict(path=path, label=label, is_noise_rec=is_noise, start=0,
+                              end=-val_fraction, file_id=file_id, gap=window_size))
+            val.append(dict(path=path, label=label, is_noise_rec=is_noise,
+                            start=-val_fraction, end=None, file_id=file_id))
     return train, val
 
 
@@ -123,45 +144,99 @@ def load_segments(segments, sample_rate, cache):
 
 
 # ---------------------------------------------------------------------------
+# Window index with energy gating
+# ---------------------------------------------------------------------------
+
+def build_window_index(segments, window_size, stride, sample_rate, gate,
+                       noise_idx, auto_noise, class_names, verbose_name):
+    """
+    Returns list of (segment_idx, start, label, occupancy) and attaches an
+    OccupancyIndex to each segment (used for jitter checks during training).
+    """
+    index = []
+    stats = defaultdict(Counter)   # class_name -> Counter(kept/noise/dropped)
+    flat_files = []
+
+    for s_idx, seg in enumerate(segments):
+        iq = seg["iq"]
+        starts = window_starts(len(iq), window_size, stride)
+        mask, block, info = activity_mask(iq, sample_rate, gate)
+        seg["occ_index"] = OccupancyIndex(mask, block)
+        cname = class_names[seg["label"]]
+
+        if seg["is_noise_rec"]:
+            # Dedicated noise recordings: every window is noise, no gating
+            for st in starts:
+                index.append((s_idx, st, noise_idx, 0.0))
+            stats[cname]["noise"] += len(starts)
+            continue
+
+        if info.get("flat"):
+            flat_files.append(seg["path"].name)
+
+        for st in starts:
+            occ = seg["occ_index"].occupancy(st, window_size)
+            if occ >= gate["min_occupancy"]:
+                index.append((s_idx, st, seg["label"], occ))
+                stats[cname]["signal"] += 1
+            elif auto_noise and noise_idx is not None and occ <= gate["noise_max_occupancy"]:
+                index.append((s_idx, st, noise_idx, occ))
+                stats[cname]["noise (auto)"] += 1
+            else:
+                stats[cname]["dropped"] += 1
+
+    print(f"\n{verbose_name} windows by source recording class:")
+    for cname in class_names:
+        if stats[cname]:
+            print(f"  {cname:<12} " + ", ".join(f"{k}: {v}" for k, v in sorted(stats[cname].items())))
+    if flat_files:
+        print(f"  Note: {len(flat_files)} recording(s) show no on/off contrast (continuous "
+              f"signal or empty) and were kept whole, e.g. {flat_files[0]}")
+    return index
+
+
+# ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
 class WindowDataset(Dataset):
-    def __init__(self, segments, window_size, stride, augment=False, sample_rate=None):
+    def __init__(self, segments, index, window_size, stride, noise_idx,
+                 min_occupancy, augment=False, sample_rate=None):
         self.segments = segments
+        self.index = index
         self.window_size = window_size
         self.stride = stride
+        self.noise_idx = noise_idx
+        self.min_occupancy = min_occupancy
         self.augment = augment
         self.sample_rate = sample_rate
         self.rng = np.random.default_rng()
 
-        self.index = []  # (segment_idx, start)
-        for s_idx, seg in enumerate(segments):
-            for start in window_starts(len(seg["iq"]), window_size, stride):
-                self.index.append((s_idx, start))
-
-        self.labels = np.array([segments[s]["label"] for s, _ in self.index], dtype=np.int64)
-        self.file_ids = np.array([segments[s]["file_id"] for s, _ in self.index], dtype=np.int64)
+        self.labels = np.array([lab for _, _, lab, _ in index], dtype=np.int64)
+        self.file_ids = np.array([segments[s]["file_id"] for s, _, _, _ in index], dtype=np.int64)
+        self.occupancies = np.array([occ for _, _, _, occ in index], dtype=np.float64)
 
     def __len__(self):
         return len(self.index)
 
     def __getitem__(self, idx):
-        s_idx, start = self.index[idx]
+        s_idx, start, label, _ = self.index[idx]
         seg = self.segments[s_idx]
         iq = seg["iq"]
 
-        if self.augment:
-            # Random time jitter so the model doesn't see fixed window alignments
+        # Time jitter for signal windows, but only if the shifted window still
+        # contains enough signal (so a burst isn't jittered out of the window).
+        if self.augment and label != self.noise_idx:
             max_start = len(iq) - self.window_size
-            start = min(max_start, start + int(self.rng.integers(0, self.stride)))
+            cand = min(max_start, start + int(self.rng.integers(0, self.stride)))
+            if seg["occ_index"].occupancy(cand, self.window_size) >= self.min_occupancy:
+                start = cand
 
         chunk = iq[start:start + self.window_size]
         if self.augment:
             chunk = augment_iq(chunk, self.rng, self.sample_rate)
 
-        x = torch.from_numpy(iq_to_features(chunk))
-        return x, seg["label"], idx
+        return torch.from_numpy(iq_to_features(chunk)), label, idx
 
 
 def worker_init_fn(worker_id):
@@ -235,7 +310,7 @@ def balanced_accuracy(cm):
 
 def print_report(cm, class_names):
     width = max(8, max(len(n) for n in class_names) + 1)
-    print("\nConfusion matrix (rows = true, cols = predicted):")
+    print("\nConfusion matrix, windows (rows = true, cols = predicted):")
     print(" " * width + "".join(f"{n[:width - 1]:>{width}}" for n in class_names))
     for i, name in enumerate(class_names):
         print(f"{name:<{width}}" + "".join(f"{v:>{width}d}" for v in cm[i]))
@@ -246,22 +321,23 @@ def print_report(cm, class_names):
               f"  {name:<{width}} n/a    (no val windows)")
 
 
-def per_recording_report(probs, labels, idx, dataset, files, class_names):
-    """Average window probabilities over each val recording -> one prediction per file."""
+def per_recording_report(probs, idx, dataset, files, class_names, noise_idx, min_occupancy):
+    """One verdict per val recording, using the same aggregation as test_model.py."""
     per_file = defaultdict(list)
     for p, i in zip(probs, idx):
-        per_file[int(dataset.file_ids[i])].append(p)
+        per_file[int(dataset.file_ids[i])].append((p, dataset.occupancies[i]))
 
-    print("\nPer-recording results (mean of window probabilities):")
+    print("\nPer-recording results (gated, noise-weighted aggregation):")
     correct = 0
-    for file_id, plist in sorted(per_file.items()):
-        path, true_label = files[file_id]
-        mean_p = np.mean(plist, axis=0)
-        pred = int(mean_p.argmax())
-        ok = pred == true_label
+    for file_id, items in sorted(per_file.items()):
+        path, true_label, _ = files[file_id]
+        res = aggregate_recording([p for p, _ in items], [o for _, o in items],
+                                  class_names, noise_idx, min_occupancy)
+        ok = res["verdict"] == class_names[true_label]
         correct += ok
         print(f"  [{'OK ' if ok else 'ERR'}] {path.name:<50} true={class_names[true_label]:<10} "
-              f"pred={class_names[pred]:<10} p={mean_p[pred]:.2f}  ({len(plist)} windows)")
+              f"pred={str(res['verdict']):<10} conf={res['confidence']:.2f}  "
+              f"signal windows {res['n_signal_windows']}/{res['n_windows']}")
     print(f"Recording-level accuracy: {correct}/{len(per_file)}")
 
 
@@ -286,6 +362,17 @@ def parse_args():
     p.add_argument("--no-gru", action="store_true", help="Disable the GRU layer")
     p.add_argument("--workers", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
+
+    g = p.add_argument_group("signal/noise gating")
+    g.add_argument("--no-auto-noise", action="store_true",
+                   help="Don't build a noise class from gaps in signal recordings")
+    g.add_argument("--threshold-db", type=float, default=DEFAULT_GATE["threshold_db"],
+                   help="Block is active if this many dB above the noise floor")
+    g.add_argument("--min-occupancy", type=float, default=DEFAULT_GATE["min_occupancy"],
+                   help="Min active fraction for a window to count as signal")
+    g.add_argument("--noise-max-occupancy", type=float, default=DEFAULT_GATE["noise_max_occupancy"],
+                   help="Max active fraction for a window to count as noise")
+    g.add_argument("--block-ms", type=float, default=DEFAULT_GATE["block_ms"])
     return p.parse_args()
 
 
@@ -295,10 +382,17 @@ def main():
     np.random.seed(args.seed)
     print("PyTorch", torch.__version__)
 
-    class_names, files = discover_files(args.root)
+    gate = {**DEFAULT_GATE,
+            "threshold_db": args.threshold_db,
+            "min_occupancy": args.min_occupancy,
+            "noise_max_occupancy": args.noise_max_occupancy,
+            "block_ms": args.block_ms}
+    auto_noise = not args.no_auto_noise
+
+    class_names, noise_idx, files = discover_files(args.root, auto_noise)
     print("Classes:", {n: i for i, n in enumerate(class_names)})
     for i, n in enumerate(class_names):
-        print(f"  {n}: {sum(1 for _, l in files if l == i)} recordings")
+        print(f"  {n}: {sum(1 for _, l, _ in files if l == i)} recordings")
 
     sample_rate = choose_sample_rate(files, args.sample_rate)
     print("Working sample rate:", sample_rate)
@@ -309,16 +403,24 @@ def main():
     load_segments(train_segs, sample_rate, cache)
     load_segments(val_segs, sample_rate, cache)
 
-    train_ds = WindowDataset(train_segs, args.window_size, args.stride,
-                             augment=True, sample_rate=sample_rate)
-    val_ds = WindowDataset(val_segs, args.window_size, args.stride,
-                           augment=False, sample_rate=sample_rate)
+    common_kw = dict(window_size=args.window_size, stride=args.stride, sample_rate=sample_rate,
+                     gate=gate, noise_idx=noise_idx, auto_noise=auto_noise, class_names=class_names)
+    train_index = build_window_index(train_segs, verbose_name="Train", **common_kw)
+    val_index = build_window_index(val_segs, verbose_name="Val", **common_kw)
 
-    print(f"Train windows: {len(train_ds)}  per class: {np.bincount(train_ds.labels, minlength=len(class_names))}")
+    ds_kw = dict(window_size=args.window_size, stride=args.stride, noise_idx=noise_idx,
+                 min_occupancy=gate["min_occupancy"], sample_rate=sample_rate)
+    train_ds = WindowDataset(train_segs, train_index, augment=True, **ds_kw)
+    val_ds = WindowDataset(val_segs, val_index, augment=False, **ds_kw)
+
+    print(f"\nTrain windows: {len(train_ds)}  per class: {np.bincount(train_ds.labels, minlength=len(class_names))}")
     print(f"Val windows:   {len(val_ds)}  per class: {np.bincount(val_ds.labels, minlength=len(class_names))}")
     if len(train_ds) == 0 or len(val_ds) == 0:
         raise SystemExit("Train or val set is empty: recordings are too short for the window size, "
                          "or there are too few recordings.")
+    if noise_idx is not None and not (train_ds.labels == noise_idx).any():
+        print(f"WARNING: no '{class_names[noise_idx]}' windows in training data. Add recordings of "
+              f"empty channels to Dataset/{class_names[noise_idx]}/ or lower --threshold-db.")
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size,
@@ -364,6 +466,8 @@ def main():
                 "model_state_dict": model.state_dict(),
                 "model_config": model_config,
                 "class_names": class_names,
+                "noise_idx": noise_idx,
+                "gate": gate,
                 "window_size": args.window_size,
                 "stride": args.stride,
                 "sample_rate": sample_rate,
@@ -383,7 +487,7 @@ def main():
     print(f"\nBest checkpoint: val loss {best_val_loss:.4f}, "
           f"window acc {(preds == labels).mean():.3f}, balanced acc {balanced_accuracy(cm):.3f}")
     print_report(cm, class_names)
-    per_recording_report(probs, labels, idx, val_ds, files, class_names)
+    per_recording_report(probs, idx, val_ds, files, class_names, noise_idx, gate["min_occupancy"])
     print(f"\nSaved best model to {args.out}")
 
 

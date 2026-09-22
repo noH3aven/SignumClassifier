@@ -93,6 +93,82 @@ def window_starts(num_samples, window_size, stride):
 
 
 # ---------------------------------------------------------------------------
+# Activity detection (signal vs. noise)
+# ---------------------------------------------------------------------------
+
+# Default gate settings; stored in the checkpoint so inference uses the same ones.
+DEFAULT_GATE = {
+    "block_ms": 1.0,          # power is measured in blocks of this length
+    "floor_percentile": 10,   # noise floor = this percentile of block power
+    "threshold_db": 8.0,      # block is "active" if this far above the floor
+    "hangover_blocks": 2,     # extend active regions by this many blocks each side
+    "min_occupancy": 0.05,    # windows with >= this active fraction count as signal
+    "noise_max_occupancy": 0.0,  # windows with <= this active fraction count as noise
+}
+
+
+def block_size_samples(sample_rate, block_ms):
+    if not sample_rate:
+        return 100
+    return max(1, int(round(sample_rate * block_ms / 1000.0)))
+
+
+def activity_mask(iq, sample_rate, gate=None):
+    """
+    Energy detector. Returns (mask, block, info):
+      mask  - bool array, one entry per block, True where signal is present
+      block - block length in samples
+      info  - dict with noise floor / dynamic range, and 'flat'=True when the
+              recording has no usable on/off contrast (fully occupied OR empty).
+
+    Works on RAW samples, i.e. before any per-window normalisation, since
+    normalising would scale noise-only windows up to look like signal.
+    """
+    gate = {**DEFAULT_GATE, **(gate or {})}
+    block = block_size_samples(sample_rate, gate["block_ms"])
+    n_blocks = len(iq) // block
+    if n_blocks == 0:
+        return np.zeros(0, dtype=bool), block, {"flat": True}
+
+    power = np.mean(np.abs(iq[: n_blocks * block].reshape(n_blocks, block)) ** 2, axis=1)
+    power_db = 10 * np.log10(power + 1e-12)
+
+    floor_db = np.percentile(power_db, gate["floor_percentile"])
+    peak_db = np.percentile(power_db, 99)
+    info = {"floor_db": float(floor_db), "dynamic_range_db": float(peak_db - floor_db)}
+
+    # No on/off contrast: either continuous signal (e.g. P25 Phase 1, a DMR
+    # repeater) or an empty channel. Energy alone can't tell which, so mark
+    # everything active and leave the decision to the classifier / noise class.
+    if peak_db - floor_db < gate["threshold_db"]:
+        info["flat"] = True
+        return np.ones(n_blocks, dtype=bool), block, info
+
+    info["flat"] = False
+    mask = power_db > floor_db + gate["threshold_db"]
+
+    h = int(gate["hangover_blocks"])
+    if h > 0:
+        mask = np.convolve(mask.astype(np.int32), np.ones(2 * h + 1, dtype=np.int32), "same") > 0
+    return mask, block, info
+
+
+class OccupancyIndex:
+    """Fast 'what fraction of [start, start+length) is active' lookups."""
+
+    def __init__(self, mask, block):
+        self.block = block
+        self.cumsum = np.concatenate([[0], np.cumsum(mask.astype(np.int64))])
+
+    def occupancy(self, start, length):
+        b0 = start // self.block
+        b1 = min((start + length) // self.block, len(self.cumsum) - 1)
+        if b1 <= b0:
+            return 0.0
+        return float(self.cumsum[b1] - self.cumsum[b0]) / (b1 - b0)
+
+
+# ---------------------------------------------------------------------------
 # Augmentation (training only)
 # ---------------------------------------------------------------------------
 
@@ -210,3 +286,57 @@ class IQResNet(nn.Module):
 def build_model(num_classes, config=None):
     config = config or {}
     return IQResNet(num_classes=num_classes, **config)
+
+
+# ---------------------------------------------------------------------------
+# Recording-level decision
+# ---------------------------------------------------------------------------
+
+def aggregate_recording(probs, occupancies, class_names, noise_idx, min_occupancy):
+    """
+    Combine window probabilities into one verdict for a recording.
+
+    Only windows that (a) the energy gate calls active and (b) the model does
+    not call noise contribute; each is weighted by 1 - p(noise). A recording
+    with no such window is reported as noise / no signal.
+
+    Returns dict(verdict, confidence, signal_probs{name: p}, n_windows,
+                 n_signal_windows, mean_p_noise).
+    """
+    probs = np.asarray(probs)
+    occupancies = np.asarray(occupancies)
+    n = len(probs)
+    signal_idx = [i for i in range(len(class_names)) if i != noise_idx]
+
+    active = occupancies >= min_occupancy
+    if noise_idx is not None:
+        p_noise = probs[:, noise_idx]
+        weights = active * (1.0 - p_noise)
+        is_signal = active & (p_noise < 0.5)
+    else:
+        p_noise = np.zeros(n)
+        weights = active.astype(np.float64)
+        is_signal = active
+
+    result = {
+        "n_windows": n,
+        "n_signal_windows": int(is_signal.sum()),
+        "mean_p_noise": float(p_noise.mean()) if n else 0.0,
+    }
+
+    if n == 0 or is_signal.sum() == 0 or weights.sum() <= 0:
+        result.update(verdict=class_names[noise_idx] if noise_idx is not None else None,
+                      confidence=float(p_noise.mean()) if n else 0.0, signal_probs={})
+        return result
+
+    sp = probs[:, signal_idx]
+    sp = sp / (sp.sum(axis=1, keepdims=True) + 1e-12)   # renormalise over signal classes
+    mean_sp = (sp * weights[:, None]).sum(axis=0) / weights.sum()
+
+    best = int(mean_sp.argmax())
+    result.update(
+        verdict=class_names[signal_idx[best]],
+        confidence=float(mean_sp[best]),
+        signal_probs={class_names[i]: float(p) for i, p in zip(signal_idx, mean_sp)},
+    )
+    return result
